@@ -3,14 +3,52 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
-ESO_URL = "https://eso.bg/load_plus_forecast.json.php"
 OUTPUT_FILE = Path("data/plexos_load_master.xlsx")
 
 
+import time
+import requests
+
+ESO_URL = "https://eso.bg/load_plus_forecast.json.php"
+
 def fetch_data():
-    r = requests.get(ESO_URL, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (GitHubActions; eso-plexos-load/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://eso.bg/doc/?460",
+    }
+
+    last_err = None
+    for attempt in range(1, 4):  # 3 опита
+        try:
+            r = requests.get(ESO_URL, headers=headers, timeout=30, allow_redirects=True)
+
+            # ако е rate limit / временен проблем
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"Temporary HTTP {r.status_code}")
+
+            r.raise_for_status()
+
+            # ако върнат HTML вместо JSON
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            text = r.text.strip()
+
+            if not text:
+                raise RuntimeError("Empty response body (no JSON).")
+
+            if "application/json" not in ctype and not text.startswith("[") and not text.startswith("{"):
+                snippet = text[:300].replace("\n", " ")
+                raise RuntimeError(f"Non-JSON response (Content-Type={ctype}): {snippet}")
+
+            return r.json()
+
+        except Exception as e:
+            last_err = e
+            # backoff
+            time.sleep(2 * attempt)
+
+    raise RuntimeError(f"Failed to fetch ESO JSON after retries: {last_err}")
+
 
 
 def build_dataframe(data):

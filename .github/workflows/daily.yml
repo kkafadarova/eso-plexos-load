@@ -3,7 +3,7 @@ name: Update ESO Load
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 6 * * *" # всеки ден 06:10 UTC
+    - cron: "10 6 * * *"   # всеки ден 06:10 UTC
 
 jobs:
   update:
