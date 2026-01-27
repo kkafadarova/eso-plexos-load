@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
-ESO_URL = "https://www.eso.bg/load_plus_forecast.json.php"
+ESO_URL = "https://eso.bg/load_plus_forecast.json.php"
 OUTPUT_FILE = Path("data/plexos_load_master.xlsx")
 
 
