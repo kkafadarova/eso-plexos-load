@@ -5,50 +5,38 @@ from pathlib import Path
 
 OUTPUT_FILE = Path("data/plexos_load_master.xlsx")
 
-
 import time
 import requests
+import re
 
-ESO_URL = "https://eso.bg/load_plus_forecast.json.php"
+ESO_FORECAST_TABLE_URL = "https://www.eso.bg/doc?37="
 
 def fetch_data():
     headers = {
-        "User-Agent": "Mozilla/5.0 (GitHubActions; eso-plexos-load/1.0)",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://eso.bg/doc/?460",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,*/*",
     }
+    r = requests.get(ESO_FORECAST_TABLE_URL, headers=headers, timeout=30)
+    r.raise_for_status()
+    html = r.text
 
-    last_err = None
-    for attempt in range(1, 4):  # 3 опита
-        try:
-            r = requests.get(ESO_URL, headers=headers, timeout=30, allow_redirects=True)
+    # Търсим редове: dd.mm.yyyy + 24 числа
+    pattern = re.compile(r"(\d{2}\.\d{2}\.\d{4})\s+((?:\d+\s+){23}\d+)")
+    matches = pattern.findall(html)
+    if not matches:
+        raise RuntimeError("Не намерих редове с прогноза в https://www.eso.bg/doc?37=")
 
-            # ако е rate limit / временен проблем
-            if r.status_code in (429, 500, 502, 503, 504):
-                raise RuntimeError(f"Temporary HTTP {r.status_code}")
+    # Връщаме в същия формат като преди: list от {name, data}
+    out = []
+    for dstr, values in matches:
+        vals = list(map(int, values.split()))
+        if len(vals) != 24:
+            continue
+        out.append({"name": dstr, "data": vals})
 
-            r.raise_for_status()
-
-            # ако върнат HTML вместо JSON
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            text = r.text.strip()
-
-            if not text:
-                raise RuntimeError("Empty response body (no JSON).")
-
-            if "application/json" not in ctype and not text.startswith("[") and not text.startswith("{"):
-                snippet = text[:300].replace("\n", " ")
-                raise RuntimeError(f"Non-JSON response (Content-Type={ctype}): {snippet}")
-
-            return r.json()
-
-        except Exception as e:
-            last_err = e
-            # backoff
-            time.sleep(2 * attempt)
-
-    raise RuntimeError(f"Failed to fetch ESO JSON after retries: {last_err}")
-
+    if not out:
+        raise RuntimeError("Намерих редове, но никой няма 24 стойности.")
+    return out
 
 
 def build_dataframe(data):
