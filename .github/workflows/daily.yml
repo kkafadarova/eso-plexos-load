@@ -3,8 +3,7 @@ name: Update ESO Load
 on:
   workflow_dispatch:
   schedule:
-    # всеки ден 07:10 UTC (зима ~ 09:10 София; лято ~ 10:10)
-    - cron: "10 7 * * *"
+    - cron: "15 6 * * *"  # всеки ден 06:15 UTC (настрой ако искаш)
 
 permissions:
   contents: write
@@ -14,7 +13,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,10 +30,18 @@ jobs:
         run: |
           python eso_loader.py
 
-      - name: Commit updated files
+      - name: Commit & push if changed
         run: |
           git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add data/plexos_load_master.xlsx data/archive/*.xlsx || true
-          git commit -m "Auto update ESO load data" || echo "No changes"
+          git config user.email "github-actions@github.com"
+
+          git add data/plexos_load_master.xlsx
+
+          # Ако няма промяна – да не fail-ва
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Auto update ESO load data"
           git push

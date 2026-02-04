@@ -1,137 +1,149 @@
 import os
-import requests
+from io import StringIO
+from datetime import datetime
 import pandas as pd
-from pathlib import Path
-from datetime import datetime, date, timedelta
-from bs4 import BeautifulSoup
+import requests
 
-URL = "https://www.eso.bg/doc?37="
+ESO_URL = os.getenv("ESO_URL", "https://www.eso.bg/doc?37=")  # това работи при теб по логовете
+OUT_PATH = os.getenv("OUT_PATH", "data/plexos_load_master.xlsx")
+SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 
-MASTER_FILE = Path("data/plexos_load_master.xlsx")
-ARCHIVE_DIR = Path("data/archive")
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "14"))  # можеш да го смениш от workflow env
+HOUR_COLS = [str(i) for i in range(1, 25)]
+FINAL_COLS = ["Year", "Month", "Day"] + HOUR_COLS
 
 
-def fetch_data() -> pd.DataFrame:
+def fetch_forecast_table() -> pd.DataFrame:
+    """
+    Чете HTML страницата и вади таблицата "Прогноза на товара на ЕЕС".
+    Връща dataframe с колони: Date + 1..24 (или подобни), които после нормализираме.
+    """
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    r = requests.get(URL, headers=headers, timeout=30)
+
+    r = requests.get(ESO_URL, headers=headers, timeout=30)
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    if not table:
-        raise RuntimeError("Не е намерена таблица с прогноза (HTML <table> липсва).")
+    # IMPORTANT: pandas.read_html приема string, но е по-сигурно през StringIO
+    tables = pd.read_html(StringIO(r.text))
+    if not tables:
+        raise RuntimeError(f"Не намерих HTML таблици в {ESO_URL}")
 
-    rows = table.find_all("tr")
-    if len(rows) < 2:
-        raise RuntimeError("Таблицата е празна или няма редове.")
+    # Обикновено правилната таблица е първата (с 'Дата/Час' + 1..24)
+    # Ако някой ден излезе друга първа, можем да търсим по колони.
+    best = None
+    for t in tables:
+        cols = [str(c).strip() for c in t.columns]
+        if any("Дата" in c for c in cols) and any(c == "1" for c in cols) and any(c == "24" for c in cols):
+            best = t
+            break
+    if best is None:
+        best = tables[0]
 
-    data = []
-    for row in rows[1:]:
-        cols = [c.get_text(strip=True) for c in row.find_all("td")]
-        if not cols:
-            continue
-
-        d = datetime.strptime(cols[0], "%d.%m.%Y").date()
-        hours = [int(x) for x in cols[1:25]]
-
-        rec = {"Year": d.year, "Month": d.month, "Day": d.day}
-        # Плексос формат: 1..24
-        for i in range(24):
-            rec[str(i + 1)] = hours[i]
-        data.append(rec)
-
-    df = pd.DataFrame(data)
-    if df.empty:
-        raise RuntimeError("Не успях да извлека данни (df е празен).")
-
-    return df.sort_values(["Year", "Month", "Day"]).reset_index(drop=True)
+    return best
 
 
-from datetime import date
+def normalize_new_data(raw: pd.DataFrame) -> pd.DataFrame:
+    # Нормализира името на първата колона към "Дата/Час"
+    raw = raw.copy()
+    raw.columns = [str(c).strip() for c in raw.columns]
 
-def merge_with_existing(new_df: pd.DataFrame) -> pd.DataFrame:
-    today = date.today()
+    date_col = raw.columns[0]  # първата колона е дата
+    df = raw.rename(columns={date_col: "Date"})
 
-    if not MASTER_FILE.exists():
-        return new_df
+    # Вадим само Date + 1..24
+    missing = [c for c in HOUR_COLS if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Липсват часови колони {missing}. Колони: {list(df.columns)}")
 
-    old_df = pd.read_excel(MASTER_FILE)
+    df = df[["Date"] + HOUR_COLS].copy()
 
-    # гарантираме типове
+    # Date: "28.01.2026" -> datetime
+    df["Date"] = pd.to_datetime(df["Date"], format="%d.%m.%Y", errors="raise")
+    df["Year"] = df["Date"].dt.year.astype(int)
+    df["Month"] = df["Date"].dt.month.astype(int)
+    df["Day"] = df["Date"].dt.day.astype(int)
+    df = df.drop(columns=["Date"])
+
+    # часовете към int (ако има NaN/стрингове)
+    for c in HOUR_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    # ред/колони
+    df = df[FINAL_COLS].copy()
+
+    return df
+
+
+def read_existing(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    existing = pd.read_excel(path, sheet_name=SHEET_NAME, dtype="Int64")
+    # Ако е празно/различна структура, пак го нормализираме
+    existing.columns = [str(c).strip() for c in existing.columns]
+
+    # гарантираме, че имаме нужните колони
+    for col in FINAL_COLS:
+        if col not in existing.columns:
+            existing[col] = pd.NA
+
+    existing = existing[FINAL_COLS].copy()
+    # Year/Month/Day като int
     for c in ["Year", "Month", "Day"]:
-        old_df[c] = old_df[c].astype(int)
-        new_df[c] = new_df[c].astype(int)
+        existing[c] = pd.to_numeric(existing[c], errors="coerce").astype("Int64")
 
-    old_df["__date__"] = pd.to_datetime(
-        old_df[["Year", "Month", "Day"]]
-    ).dt.date
+    return existing
 
-    new_df["__date__"] = pd.to_datetime(
-        new_df[["Year", "Month", "Day"]]
-    ).dt.date
 
-    # 1️⃣ миналото: пазим само от old_df
-    past = old_df[old_df["__date__"] < today]
+def merge_append(existing: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    # Ключ = дата (Year/Month/Day)
+    key_cols = ["Year", "Month", "Day"]
 
-    # 2️⃣ бъдещето: взимаме от new_df (обновена прогноза)
-    future = new_df[new_df["__date__"] >= today]
+    # махаме дубликати в new_df
+    new_df = new_df.drop_duplicates(subset=key_cols, keep="last")
 
-    merged = pd.concat([past, future], ignore_index=True)
+    # merge: взимаме всички стари + само нови дати
+    merged = pd.concat([existing, new_df], ignore_index=True)
 
-    merged = (
-        merged.sort_values(["Year", "Month", "Day"])
-        .drop(columns="__date__")
-        .reset_index(drop=True)
+    # махаме дубликати по дата (ако има, предпочитаме "last" = новите стойности)
+    merged = merged.drop_duplicates(subset=key_cols, keep="last")
+
+    # сортиране по дата
+    merged["_dt"] = pd.to_datetime(
+        merged["Year"].astype(str) + "-" + merged["Month"].astype(str) + "-" + merged["Day"].astype(str),
+        errors="coerce",
     )
+    merged = merged.sort_values("_dt").drop(columns=["_dt"]).reset_index(drop=True)
 
     return merged
 
-def archive_snapshot(df: pd.DataFrame) -> Path:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = date.today().strftime("%Y-%m-%d")
-    archive_path = ARCHIVE_DIR / f"plexos_load_{stamp}.xlsx"
-    df.to_excel(archive_path, index=False)
-    return archive_path
 
-
-def cleanup_old_archives():
-    if not ARCHIVE_DIR.exists():
-        return
-
-    cutoff = date.today() - timedelta(days=RETENTION_DAYS)
-    for p in ARCHIVE_DIR.glob("plexos_load_*.xlsx"):
-        # очакваме plexos_load_YYYY-MM-DD.xlsx
-        name = p.stem  # plexos_load_YYYY-MM-DD
-        try:
-            stamp = name.replace("plexos_load_", "")
-            d = datetime.strptime(stamp, "%Y-%m-%d").date()
-        except Exception:
-            continue
-
-        if d < cutoff:
-            p.unlink()
+def write_xlsx(df: pd.DataFrame, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=SHEET_NAME)
 
 
 def main():
-    print("Fetching ESO data...")
-    new_df = fetch_data()
+    print("Fetching ESO data…")
+    raw = fetch_forecast_table()
+    new_df = normalize_new_data(raw)
 
-    print("Merging with existing master...")
-    final_df = merge_with_existing(new_df)
+    existing = read_existing(OUT_PATH)
+    merged = merge_append(existing, new_df)
 
-    MASTER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    final_df.to_excel(MASTER_FILE, index=False)
-    print(f"✅ Updated master: {MASTER_FILE} (rows={len(final_df)})")
+    before = len(existing)
+    after = len(merged)
+    print(f"Rows: {before} -> {after} (added/updated: {after - before if after >= before else 0})")
 
-    archive_path = archive_snapshot(final_df)
-    print(f"📌 Archived snapshot: {archive_path}")
-
-    cleanup_old_archives()
-    print(f"🧹 Cleanup done (retention={RETENTION_DAYS} days)")
+    write_xlsx(merged, OUT_PATH)
+    print(f"Saved: {OUT_PATH}")
 
 
 if __name__ == "__main__":
